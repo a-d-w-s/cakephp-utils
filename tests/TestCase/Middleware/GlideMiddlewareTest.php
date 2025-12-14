@@ -1,0 +1,258 @@
+<?php
+declare(strict_types=1);
+
+namespace ADWS\Utils\Test\TestCase\Middleware;
+
+use ADWS\Utils\Exception\ResponseException;
+use ADWS\Utils\Exception\SignatureException;
+use ADWS\Utils\Middleware\GlideMiddleware;
+use Cake\Core\Configure;
+use Cake\Event\EventManager;
+use Cake\Http\Response;
+use Cake\Http\ServerRequest;
+use Cake\Http\ServerRequestFactory;
+use Cake\TestSuite\TestCase;
+use Cake\Utility\Security;
+use Laminas\Diactoros\Stream;
+use League\Flysystem\UnableToRetrieveMetadata;
+use League\Glide\ServerFactory;
+use League\Glide\Signatures\Signature;
+use Psr\Http\Server\RequestHandlerInterface;
+use TestApp\Http\TestRequestHandler;
+
+class GlideMiddlewareTest extends TestCase
+{
+    /**
+     * Default config.
+     *
+     * @var array<string,mixed>
+     */
+    protected array $config;
+    protected ServerRequest $request;
+    protected RequestHandlerInterface $handler;
+
+    public function setUp(): void
+    {
+        $this->config = [
+            'server' => [
+                'source' => WWW_ROOT . '/upload',
+                'cache' => TMP . 'cache',
+            ],
+        ];
+
+        $this->request = ServerRequestFactory::fromGlobals(
+            ['REQUEST_URI' => '/images/sample.jpg'],
+            ['w' => '100'],
+        );
+        $this->handler = new TestRequestHandler();
+
+        Security::setSalt('salt');
+
+        exec('rm -rf ' . TMP . 'cache/sample.jpg');
+        clearstatcache(false, TMP . 'cache/sample.jpg');
+    }
+
+    public function testNormalResponse(): void
+    {
+        $middleware = new GlideMiddleware($this->config);
+        $response = $middleware->process($this->request, $this->handler);
+
+        $this->assertTrue(is_dir(TMP . 'cache/sample.jpg'));
+
+        $headers = $response->getHeaders();
+        $this->assertTrue(isset($headers['Content-Length']));
+    }
+
+    public function testServerCallable(): void
+    {
+        $config = $this->config;
+        $config['server'] = function () {
+            return ServerFactory::create(
+                $this->config['server'] + ['base_url' => '/images'],
+            );
+        };
+
+        $middleware = new GlideMiddleware($config);
+        $middleware->process($this->request, $this->handler);
+
+        $this->assertTrue(is_dir(TMP . 'cache/sample.jpg'));
+    }
+
+    public function testAllowedParams(): void
+    {
+        $this->config['allowedParams'] = ['w'];
+        $middleware = new GlideMiddleware($this->config);
+        $middleware->process($this->request, $this->handler);
+
+        $request = ServerRequestFactory::fromGlobals(
+            ['REQUEST_URI' => '/images/sample.jpg'],
+            ['w' => '100', 'foo' => 'bar'],
+        );
+
+        $middleware = new GlideMiddleware($this->config);
+        $middleware->process($request, $this->handler);
+
+        $files = glob(TMP . 'cache/sample.jpg/*');
+        $this->assertSame(1, count($files));
+    }
+
+    public function testOriginalPassThrough(): void
+    {
+        $fileSize = filesize(WWW_ROOT . 'upload/sample.jpg');
+
+        $request = ServerRequestFactory::fromGlobals([
+            'REQUEST_URI' => '/images/sample.jpg',
+        ]);
+
+        $middleware = new GlideMiddleware($this->config);
+        $response = $middleware->process($request, $this->handler);
+
+        $this->assertTrue(is_dir(TMP . 'cache/sample.jpg'));
+
+        $headers = $response->getHeaders();
+        $this->assertNotSame(
+            $fileSize,
+            (int)$headers['Content-Length'][0],
+            'Content length shouldnt be same as original filesize since glide always generates new file.',
+        );
+
+        exec('rm -rf ' . TMP . 'cache/sample.jpg');
+        clearstatcache(false, TMP . 'cache/sample.jpg');
+
+        $middleware = new GlideMiddleware($this->config + ['originalPassThrough' => true]);
+        $response = $middleware->process($request, $this->handler);
+
+        $this->assertFalse(is_dir(TMP . 'cache/sample.jpg'));
+
+        $headers = $response->getHeaders();
+        $this->assertSame($fileSize, (int)$headers['Content-Length'][0]);
+    }
+
+    public function testPathConfig(): void
+    {
+        $middleware = new GlideMiddleware(['path' => '/img'] + $this->config);
+        $response = $middleware->process($this->request, $this->handler);
+
+        $this->assertFalse(is_dir(TMP . 'cache/sample.jpg'));
+
+        $headers = $response->getHeaders();
+        $this->assertFalse(isset($headers['Content-Length']));
+    }
+
+    public function testSecureUrl(): void
+    {
+        $this->config['security']['secureUrls'] = true;
+
+        $signature = new Signature(Security::getSalt());
+        $sig = $signature->generateSignature('/images/sample.jpg', ['w' => 100]);
+
+        $request = ServerRequestFactory::fromGlobals(
+            ['REQUEST_URI' => '/images/sample.jpg'],
+            ['w' => 100, 's' => $sig],
+        );
+
+        $middleware = new GlideMiddleware($this->config);
+        $middleware->process($request, $this->handler);
+
+        $this->assertTrue(is_dir(TMP . 'cache/sample.jpg'));
+    }
+
+    public function testCache(): void
+    {
+        $middleware = new GlideMiddleware($this->config);
+        $response = $middleware->process($this->request, $this->handler);
+
+        $this->assertTrue(is_dir(TMP . 'cache/sample.jpg'));
+
+        $headers = $response->getHeaders();
+        $this->assertTrue($response->getBody() instanceof Stream);
+        $this->assertTrue(isset($headers['Last-Modified']));
+        $this->assertTrue(isset($headers['Expires']));
+
+        $request = ServerRequestFactory::fromGlobals(
+            [
+                'REQUEST_URI' => '/images/sample.jpg',
+                'HTTP_IF_MODIFIED_SINCE' => $headers['Last-Modified'][0],
+            ],
+            ['w' => '100'],
+        );
+
+        $middleware = new GlideMiddleware($this->config);
+        $response = $middleware->process($request, $this->handler);
+
+        $this->assertEquals(304, $response->getStatusCode());
+        $this->assertEquals('', $response->getBody()->getContents());
+        $this->assertFalse(isset($response->getHeaders()['Expires']));
+    }
+
+    public function testHeaders(): void
+    {
+        $this->config['headers'] = [
+            'X-Custom' => 'some-value',
+        ];
+
+        $middleware = new GlideMiddleware($this->config);
+        $response = $middleware->process($this->request, $this->handler);
+        $this->assertEquals('some-value', $response->getHeaders()['X-Custom'][0]);
+    }
+
+    public function testSignatureException(): void
+    {
+        $this->config['security']['secureUrls'] = true;
+
+        $signature = new Signature(Security::getSalt());
+        $signature->generateSignature('/images/cake logo.png', ['w' => 100]);
+
+        $request = ServerRequestFactory::fromGlobals([
+            'REQUEST_URI' => '/images/cake%20logo.png',
+        ]);
+
+        $middleware = new GlideMiddleware($this->config);
+
+        $this->expectException(SignatureException::class);
+        $this->expectExceptionCode(403);
+        $this->expectExceptionMessage('Signature is missing.');
+        $middleware->process($request, $this->handler);
+    }
+
+    public function test3rdPartyException(): void
+    {
+        $middleware = new GlideMiddleware($this->config);
+        $request = ServerRequestFactory::fromGlobals([
+            'REQUEST_URI' => '/images/non-existent.jpg',
+        ]);
+
+        $this->expectException(UnableToRetrieveMetadata::class);
+        $middleware->process($request, $this->handler);
+    }
+
+    public function testResponseException(): void
+    {
+        $middleware = new GlideMiddleware($this->config);
+        $request = ServerRequestFactory::fromGlobals([
+            'REQUEST_URI' => '/images/non-existent.jpg',
+        ]);
+
+        Configure::write('debug', false);
+        $this->expectException(ResponseException::class);
+        $middleware->process($request, $this->handler);
+        Configure::write('debug', true);
+    }
+
+    public function testExceptionEventListener(): void
+    {
+        $middleware = new GlideMiddleware($this->config);
+        $request = ServerRequestFactory::fromGlobals([
+            'REQUEST_URI' => '/images/non-existent.jpg',
+        ]);
+
+        EventManager::instance()->on(GlideMiddleware::RESPONSE_FAILURE_EVENT, function ($event) {
+            return (new Response())
+                ->withFile(WWW_ROOT . 'upload/sample.jpg');
+        });
+
+        $response = $middleware->process($request, $this->handler);
+        $this->assertEquals(200, $response->getStatusCode());
+        $this->assertEquals('image/jpeg', $response->getHeaderLine('Content-Type'));
+    }
+}

@@ -1,0 +1,10 @@
+.idea
+vendor
+.phpunit.cache
+composer.lock
+
+# local testing
+.docker
+.env
+docker-compose.yml
+index.php
