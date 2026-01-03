@@ -43,6 +43,49 @@ class FileUploadService
     }
 
     /**
+     * Upload single file
+     *
+     * @param \Laminas\Diactoros\UploadedFile $file Uploadnutý soubor
+     * @param int $id ID entity
+     * @param string $type Typ souboru (např. "article", "product")
+     * @return string|null Název uloženého souboru
+     * @throws \RuntimeException Pokud upload nebo zpracování selže
+     */
+    public function upload(
+        UploadedFile $file,
+        int $id,
+        string $type,
+    ): ?string {
+        if ($file->getError() === UPLOAD_ERR_NO_FILE) {
+            return null;
+        }
+
+        $folder = $this->Folder->folder($id);
+        $targetDir = "img/{$type}/{$folder}/files";
+        $this->Folder->create($targetDir);
+
+        $this->assertValidUpload($file);
+        $this->assertValidMimeType($file);
+
+        $baseName = Text::slug(
+            pathinfo((string)$file->getClientFilename(), PATHINFO_FILENAME),
+        );
+
+        if ($baseName === '') {
+            throw new RuntimeException('Invalid filename');
+        }
+
+        $ext = $this->detectExtension($file);
+
+        $filename = strtolower($baseName . '.' . $ext);
+        $targetPath = $this->Path->convert("{$targetDir}/{$filename}");
+
+        $file->moveTo($targetPath);
+
+        return $filename;
+    }
+
+    /**
      * Upload multiple files
      *
      * @param array<\Laminas\Diactoros\UploadedFile> $files

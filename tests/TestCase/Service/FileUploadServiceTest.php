@@ -54,9 +54,35 @@ class FileUploadServiceTest extends TestCase
         parent::tearDown();
     }
 
+    public function testUploadSingle(): void
+    {
+        $id = 1;
+        $type = 'articles';
+
+        $folder = $this->Folder->folder($id);
+
+        $tmpFile = tempnam(sys_get_temp_dir(), 'upload');
+        copy($this->fixtureFile, $tmpFile);
+
+        $uploadedFile = new UploadedFile(
+            $tmpFile,
+            filesize($tmpFile),
+            UPLOAD_ERR_OK,
+            'document.pdf',
+            'application/pdf',
+        );
+
+        $filename = $this->Service->upload($uploadedFile, $id, $type);
+        $filePath = $this->tmpUploadDir . "/{$type}/{$folder}/files/{$filename}";
+
+        $this->assertSame('document.pdf', $filename);
+        $this->assertFileExists($filePath);
+        $this->assertGreaterThan(0, filesize($filePath));
+    }
+
     public function testUploadMultipleFiles(): void
     {
-        $id = 123;
+        $id = 2;
         $type = 'articles';
 
         $uploadedFiles = [];
